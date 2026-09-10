@@ -1,6 +1,9 @@
-fastmcp>=2.12.0
-uvicorn>=0.35.0
-garminconnect>=0.2.38
+# Upper bounds pinned on purpose.
+# garminconnect 0.3.0+ dropped garth and switched to its own curl_cffi auth,
+# which is incompatible with src/garmin_client.py. Do not relax these.
+fastmcp>=2.12.0,<3.0.0
+uvicorn>=0.35.0,<1.0.0
+garminconnect>=0.2.38,<0.3.0
 garth>=0.5.17,<0.6.0
-python-dotenv>=1.0.0
-requests>=2.32.0
+python-dotenv>=1.0.0,<2.0.0
+requests>=2.32.0,<3.0.0
