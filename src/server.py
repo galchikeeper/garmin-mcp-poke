@@ -1,9 +1,14 @@
 """
 Garmin MCP Server - Poke Compatible
-All 95+ tools from garmin_mcp, served over HTTP for Poke.
+All 95+ tools from garmin_mcp, served over HTTP.
+
+2026-09-10: an auth failure no longer kills the process.
+The server always starts. Authentication runs as a background warmup and is
+retried lazily on the first tool call that needs it.
 """
 import os
 import sys
+import threading
 
 # Add src directory to path for module imports
 sys.path.insert(0, os.path.dirname(__file__))
@@ -18,6 +23,24 @@ from garmin_client import init_garmin_client
 
 # Import all tool modules
 from modules import (
+activity_management,
+health_wellness,
+training,
+user_profile,
+devices,
+gear_management,
+weight_management,
+challenges,
+workouts,
+workout_templates,
+data_management,
+womens_health,
+)
+
+# Build the proxy. No network call happens here.
+garmin_client = init_garmin_client()
+
+MODULES = (
     activity_management,
     health_wellness,
     training,
@@ -27,58 +50,41 @@ from modules import (
     weight_management,
     challenges,
     workouts,
-    workout_templates,
     data_management,
     womens_health,
 )
 
-# Initialize Garmin client
-garmin_client = init_garmin_client()
-if not garmin_client:
-    print("Failed to initialize Garmin Connect client. Exiting.", file=sys.stderr)
-    sys.exit(1)
+for module in MODULES:
+        module.configure(garmin_client)
 
-print("Garmin Connect client initialized successfully.", file=sys.stderr)
-
-# Configure all modules with the Garmin client
-activity_management.configure(garmin_client)
-health_wellness.configure(garmin_client)
-training.configure(garmin_client)
-user_profile.configure(garmin_client)
-devices.configure(garmin_client)
-gear_management.configure(garmin_client)
-weight_management.configure(garmin_client)
-challenges.configure(garmin_client)
-workouts.configure(garmin_client)
-data_management.configure(garmin_client)
-womens_health.configure(garmin_client)
-
-# Create FastMCP app (standalone fastmcp package, not mcp.server.fastmcp)
 mcp = FastMCP("Garmin MCP Server")
 
-# Register tools from all modules
-mcp = activity_management.register_tools(mcp)
-mcp = health_wellness.register_tools(mcp)
-mcp = training.register_tools(mcp)
-mcp = user_profile.register_tools(mcp)
-mcp = devices.register_tools(mcp)
-mcp = gear_management.register_tools(mcp)
-mcp = weight_management.register_tools(mcp)
-mcp = challenges.register_tools(mcp)
-mcp = workouts.register_tools(mcp)
-mcp = data_management.register_tools(mcp)
-mcp = womens_health.register_tools(mcp)
+for module in MODULES:
+        mcp = module.register_tools(mcp)
 
-# Register resources (workout templates)
 mcp = workout_templates.register_resources(mcp)
 
-# Run the server
+# Health check - used for keep-alive pings and for reading auth status.
+try:
+        from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request):
+                return JSONResponse({"ok": True, **garmin_client.status()})
+
+except Exception as exc:
+    print(f"[server] skipping /health route: {exc}", file=sys.stderr, flush=True)
+
+
 if __name__ == "__main__":
-    print(f"Starting Garmin MCP Server on {HOST}:{PORT}", file=sys.stderr)
+        print(f"Starting Garmin MCP Server on {HOST}:{PORT}", file=sys.stderr, flush=True)
+
+    # Warm up auth in parallel with the server bind to cut first-call latency.
+        threading.Thread(target=garmin_client.warmup, daemon=True).start()
 
     mcp.run(
-        transport="http",
-        host=HOST,
-        port=PORT,
-        stateless_http=True,
+                transport="http",
+                host=HOST,
+                port=PORT,
+                stateless_http=True,
     )
