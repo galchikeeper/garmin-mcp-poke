@@ -1,10 +1,17 @@
 # Garmin MCP free-plan operations
 
-`ops/keepalive.yml` is an inactive template. Nothing in this directory installs a
-monitor, changes Render, calls Garmin, or starts a GitHub schedule. Keep the
-repository variable `RENDER_FREE_HOURS_VERIFIED` unset for now: the Render service
-inventory has not been verified, and waking the old deployment may initiate Garmin
-authentication.
+`ops/keepalive.yml` is an inactive template. The installed workflow is
+`.github/workflows/garmin-keepalive.yml`. During the authorized 2026-09-28 rollout,
+the safe server and encrypted token store were deployed, restart restoration
+passed, the sole free-instance budget was checked, and the repository variable
+`RENDER_FREE_HOURS_VERIFIED` was set to `true`. The initial health-only workflow
+passed. This does not establish Garmin authentication or long-term uptime.
+
+**Deployment drift:** the rollout set the live service's Auto-Deploy to **Off**.
+The legacy Blueprint pointed to a different upstream repository, so its Auto Sync
+was paused without deleting or disconnecting it. Do not manually sync that old
+Blueprint: review its source and environment handling first. A local Blueprint
+file alone is not evidence of the actual service configuration.
 
 ## Prerequisites before enabling keepalive
 

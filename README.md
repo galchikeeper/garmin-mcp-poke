@@ -29,12 +29,16 @@ GitHub Gist persistence. Process startup and `GET /health` never call Garmin.
    cooldown, uses hidden password/MFA entry, performs one Garth login, and saves
    tokens to Gist plus a mode-0600 seed file. It never prints token values.
    A failed login exits without retry. Do not run it on Render.
-5. Deploy the reviewed code with the environment in place. `autoDeploy: false`
-   remains in `render.yaml`. Run a single read-only Garmin tool after cooldown;
+5. Deploy the reviewed code with the environment in place and explicit approval.
+   Verify the live Dashboard setting rather than trusting `render.yaml` alone.
+   The authorized rollout on 2026-09-28 set service Auto-Deploy to **Off** and
+   paused the legacy upstream Blueprint's Auto Sync to prevent configuration drift.
+   Run a single read-only Garmin tool after cooldown;
    then confirm `authenticated: true`, `token_source: gist`, and no storage error.
 6. Follow [ops/OPERATIONS.md](ops/OPERATIONS.md) before enabling keepalive.
-   The template in `ops/keepalive.yml` is **inactive**. Verify the workspace's
-   free-instance-hour budget and deploy safe health/startup code first.
+   The template in `ops/keepalive.yml` is inactive; the installed workflow is
+   `.github/workflows/garmin-keepalive.yml`. Its gate was enabled after checking
+   the free-instance-hour budget and live safe-health/restart behavior.
 
 A secret Gist is unlisted, **not private**. Only authenticated ciphertext is
 stored there; the key, Garmin password, and GitHub credential never go into the
