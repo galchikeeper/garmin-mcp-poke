@@ -2,9 +2,8 @@
 Garmin MCP Server - Poke Compatible
 All 95+ tools from garmin_mcp, served over HTTP.
 
-2026-09-10: an auth failure no longer kills the process.
-The server always starts. Authentication runs as a background warmup and is
-retried lazily on the first tool call that needs it.
+An auth failure does not kill the process. Authentication happens lazily on
+an explicit tool request; background warmup requires an explicit opt-in.
 """
 import os
 import sys
@@ -79,8 +78,10 @@ except Exception as exc:
 if __name__ == "__main__":
     print(f"Starting Garmin MCP Server on {HOST}:{PORT}", file=sys.stderr, flush=True)
 
-    # Warm up auth in parallel with the server bind to cut first-call latency.
-    threading.Thread(target=garmin_client.warmup, daemon=True).start()
+    # Render restarts must not trigger another login during a Garmin outage.
+    # Authenticate on an explicit data request unless warmup is opted into.
+    if os.getenv("GARMIN_AUTH_WARMUP", "false").lower() == "true":
+        threading.Thread(target=garmin_client.warmup, daemon=True).start()
 
     mcp.run(
         transport="http",

@@ -58,6 +58,37 @@ Open http://localhost:3000 and connect to `http://localhost:8000/mcp` using "Str
 
 ## Token Refresh
 
+### Garmin authentication returns HTTP 429
+
+The server pauses Garmin requests for 30 minutes after a 429, doubles that
+local delay on repeated failures (up to two hours), and respects longer
+`Retry-After` values when the upstream exception exposes that header. This
+is a client cooldown, **not a guarantee that Garmin will accept the next request**.
+`GARMIN_RATE_LIMIT_COOLDOWN_SEC` changes the initial local delay in seconds.
+Requests and token refreshes are serialized within the server process.
+`/health` reports `retry_after_seconds` without contacting Garmin.
+
+Authentication warmup is disabled by default. Render startup and health checks
+do not initiate a Garmin login. Set `GARMIN_AUTH_WARMUP=true` only if startup
+authentication is intentionally required.
+
+Do not repeatedly restart, redeploy, regenerate tokens, or retry from multiple
+clients during a rate limit. The cooldown is held in memory and resets when
+the process restarts; it is not coordinated across multiple server replicas.
+After the cooldown, make one small read to check access. If it returns 429,
+stop and investigate authentication library compatibility and token validity.
+
+This guard does not repair expired tokens or migrate the legacy Garth login
+flow. The server still intentionally pins garminconnect below 0.3 because
+its existing token and workout code depend on Garth. Changing that pin alone
+is not a supported migration.
+
+Run the credential-free regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 Tokens last approximately 6 months. When they expire, re-run `generate_tokens.py` and update the Render env var.
 
 ## Tool Categories
