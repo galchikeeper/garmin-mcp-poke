@@ -1,3 +1,6 @@
+# Migration requires a persistent disk and fresh DI tokens BEFORE deployment.
+# This file does not purchase/upgrade a plan. Attach a disk in Render first;
+# free instances cannot meet the durable storage requirement.
 services:
   - type: web
     name: garmin-mcp-server
@@ -6,10 +9,11 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python src/server.py
     autoDeploy: false
+    healthCheckPath: /health
     envVars:
-      - key: GARMINTOKENS_BASE64
-        sync: false
-      - key: GARMIN_EMAIL
-        sync: false
-      - key: GARMIN_PASSWORD
-        sync: false
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: GARMIN_STATE_DIR
+        value: /var/data/garmin
+      - key: GARMIN_TOKEN_SOURCE
+        value: /etc/secrets/garmin_tokens.json
