@@ -1,0 +1,42 @@
+name: Garmin MCP health keepalive
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub schedules can be delayed; durable tokens also survive cold starts.
+    - cron: '3-59/10 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garmin-mcp-health-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  health:
+    if: ${{ github.event.repository.private == false && vars.RENDER_FREE_HOURS_VERIFIED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check process health once
+        shell: bash
+        env:
+          HEALTH_URL: https://garmin-mcp-server-kj2q.onrender.com/health
+        run: |
+          set -euo pipefail
+          health_file="$(mktemp)"
+          curl --fail --silent --show-error \
+            --proto '=https' --connect-timeout 15 --max-time 85 --retry 0 \
+            --output "$health_file" "$HEALTH_URL"
+          python3 - "$health_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as response:
+              health = json.load(response)
+          if not isinstance(health, dict) or health.get("ok") is not True:
+              raise SystemExit("Health endpoint did not report process readiness.")
+          # Cooldown does not mean the process is unhealthy. Never call Garmin.
+          print("Process health OK; Garmin authentication was not tested.")
+          PY
