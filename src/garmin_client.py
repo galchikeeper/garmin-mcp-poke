@@ -1,42 +1,37 @@
-"""
-Garmin Connect authentication wrapper for cloud deployment.
+"""Token-only Garmin sessions with durable rate limiting; no unattended SSO login.
 
-Design:
-- Server startup is decoupled from Garmin authentication. The process stays
-  alive even when auth fails.
-- Auth happens on first use and is retried once on a 401/403 style error.
-- HTTP 429 pauses requests and never triggers immediate re-authentication.
-- Failures surface as exceptions the MCP tools turn into error text.
-  The process never calls sys.exit().
+Pinned to garminconnect 0.3.16 because the small native-client adapter below
+uses its refresh/transport hooks. Test these hooks before updating the pin.
 """
 import functools
-import io
+import hashlib
+import json
 import math
 import os
 import re
-import sys
 import threading
 import time
-from email.utils import parsedate_to_datetime
 from datetime import timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 
 from garminconnect import Garmin, GarminConnectAuthenticationError
-
-from config import GARMINTOKENS_BASE64, GARMIN_EMAIL, GARMIN_PASSWORD
-
-AUTH_MARKERS = ("unauthorized", "forbidden")
+from garminconnect.client import Client
+from state_store import StateStore, StorageError, atomic_json, read_json
 
 
 class GarminRateLimitError(RuntimeError):
-    """A local cooldown, not a promise about when Garmin's limit expires."""
-
     def __init__(self, retry_after_seconds):
         self.retry_after_seconds = max(1, math.ceil(retry_after_seconds))
         super().__init__(
-            "Garmin returned 429. Requests are paused for "
-            f"{self.retry_after_seconds} seconds; do not retry or re-authenticate "
-            "before then. This is a local cooldown, not Garmin's reset time."
+            f"Garmin returned 429. Requests are paused for {self.retry_after_seconds} "
+            "seconds. Do not retry or re-authenticate before then. "
+            "This is a local cooldown, not Garmin's reset time."
         )
+
+
+class GarminSetupError(RuntimeError):
+    pass
 
 
 def _exceptions(exc):
@@ -55,21 +50,20 @@ def _exceptions(exc):
 
 def _is_rate_limit(exc):
     for current in _exceptions(exc):
-        response = getattr(current, "response", None)
-        if getattr(response, "status_code", None) == 429:
+        if isinstance(current, GarminRateLimitError):
+            return True
+        if getattr(getattr(current, "response", None), "status_code", None) == 429:
             return True
         text = f"{type(current).__name__} {current}".lower()
         if "toomanyrequests" in text or re.search(r"\b429\b", text):
             return True
-    return isinstance(exc, GarminRateLimitError)
+    return False
 
 
 def _retry_after(exc):
-    """Read Retry-After from the HTTP error, including wrapped exceptions."""
     delays = []
     for current in _exceptions(exc):
-        response = getattr(current, "response", None)
-        headers = getattr(response, "headers", {}) or {}
+        headers = getattr(getattr(current, "response", None), "headers", {}) or {}
         value = headers.get("Retry-After", headers.get("retry-after"))
         if value is None:
             continue
@@ -88,161 +82,217 @@ def _retry_after(exc):
     return max(delays) if delays else None
 
 
-def _log(msg):
-    print(f"[garmin] {msg}", file=sys.stderr, flush=True)
-
-
 def _is_auth_error(exc):
-    # GarthHTTPError also represents 429 and other non-authentication failures.
-    # An OAuth URL in an error message does not justify another login.
     if _is_rate_limit(exc):
         return False
-    if isinstance(exc, GarminConnectAuthenticationError):
-        return True
-    text = f"{type(exc).__name__} {exc}".lower()
-    return bool(re.search(r"\b(?:401|403)\b", text)) or any(m in text for m in AUTH_MARKERS)
-
-
-def _auth_with_tokens(token_base64):
-    old_stderr = sys.stderr
-    sys.stderr = io.StringIO()
-    try:
-        garmin = Garmin()
-        garmin.login(token_base64)
-    finally:
-        sys.stderr = old_stderr
-    _log("authenticated with tokens.")
-    return garmin
-
-
-def _auth_with_credentials(email, password):
-    garmin = Garmin(email=email, password=password, is_cn=False)
-    garmin.login()
-    _log("authenticated with email and password.")
-    return garmin
-
-
-def _authenticate():
-    """Perform the actual login. Exceptions propagate to the caller."""
-    if GARMINTOKENS_BASE64:
-        return _auth_with_tokens(GARMINTOKENS_BASE64)
-    if GARMIN_EMAIL and GARMIN_PASSWORD:
-        return _auth_with_credentials(GARMIN_EMAIL, GARMIN_PASSWORD)
-    raise RuntimeError(
-        "No Garmin credentials configured. Set GARMINTOKENS_BASE64 or "
-        "GARMIN_EMAIL + GARMIN_PASSWORD."
+    return any(
+        isinstance(current, GarminConnectAuthenticationError)
+        or re.search(r"\b(?:401|403)\b", str(current))
+        for current in _exceptions(exc)
     )
 
 
+def validate_tokens(data):
+    if not isinstance(data, dict) or not all(
+        isinstance(data.get(key), str) and data[key].strip()
+        for key in ("di_token", "di_refresh_token", "di_client_id")
+    ):
+        raise GarminSetupError(
+            "Modern DI tokens are required. Run scripts/generate_tokens.py locally. "
+            "Legacy GARMINTOKENS_BASE64 cannot be used by this version."
+        )
+    return {key: data[key] for key in ("di_token", "di_refresh_token", "di_client_id")}
+
+
+class PersistentClient(Client):
+    def _refresh_session(self):
+        # Upstream 0.3.16 swallows refresh errors. Propagate instead so a 429
+        # stops before any API request, and a failed disk write fails closed.
+        with self._token_lock:
+            self._refresh_di_token()
+            if not self._tokenstore_path:
+                raise StorageError("Token persistence is not configured")
+            try:
+                atomic_json(Path(self._tokenstore_path) / "garmin_tokens.json", validate_tokens(json.loads(self.dumps())))
+            except OSError as exc:
+                raise StorageError("Cannot persist refreshed tokens; requests stopped") from exc
+
+
+def restore_client(store, transport_guard):
+    client = Garmin(retry_attempts=0)
+    client.client = PersistentClient()
+    native = client.client
+    native.load(str(store.directory))  # Local read only; never Garmin.login().
+    native._api_session.request = transport_guard(native._api_session.request)
+    native._http_post = transport_guard(native._http_post)
+    # Load required profile fields once; upstream login retries these 3 times.
+    profile = client.connectapi("/userprofile-service/socialProfile")
+    settings = client.connectapi(client.garmin_connect_user_settings_url)
+    if not isinstance(profile, dict) or not isinstance(settings, dict) or not isinstance(settings.get("userData"), dict):
+        raise GarminSetupError("Garmin returned an invalid profile or settings response")
+    client.display_name = profile.get("displayName")
+    client.full_name = profile.get("fullName", "")
+    client.profile_id = profile.get("profileId")
+    client.unit_system = settings["userData"].get("measurementSystem")
+    return client
+
+
 class GarminProxy:
-    """The single handle every tool module holds.
-
-    The inner client can be swapped out, so an expired token is re-authenticated
-    without touching any module code.
-    """
-
-    def __init__(self):
+    def __init__(self, state_dir=None):
         self._client = None
+        self._client_digest = None
         self._lock = threading.RLock()
+        self._fatal_error = None
         self._last_error = None
-        self._last_attempt = 0.0
-        self._blocked_until = 0.0
-        self._rate_limit_count = 0
+        self._state = None
+        self._store = None
+        try:
+            self._store = StateStore(state_dir)
+        except (OSError, StorageError):
+            self._fatal_error = "Persistent storage unavailable. Configure GARMIN_STATE_DIR on a persistent disk."
         try:
             cooldown = float(os.getenv("GARMIN_RATE_LIMIT_COOLDOWN_SEC", "1800"))
         except ValueError:
             cooldown = 1800.0
         self._cooldown = cooldown if math.isfinite(cooldown) and cooldown > 0 else 1800.0
 
+    def _save(self):
+        try:
+            self._store.save_guard(self._state)
+        except StorageError:
+            self._fatal_error = "Cannot persist request guard; requests stopped"
+            raise
+
     def _check_cooldown(self):
-        remaining = self._blocked_until - time.monotonic()
+        if self._fatal_error:
+            raise StorageError(self._fatal_error)
+        remaining = self._state["blocked_until"] - time.time()
         if remaining > 0:
             raise GarminRateLimitError(remaining)
 
     def _record_rate_limit(self, exc):
-        self._rate_limit_count += 1
-        fallback = min(self._cooldown * (2 ** min(self._rate_limit_count - 1, 10)), 7200)
-        # Never shorten a longer delay explicitly supplied by Garmin.
+        # A low-level transport can already have recorded this same error.
+        # Some upstream wrappers discard the original exception/headers.
+        remaining = self._state["blocked_until"] - time.time()
+        if remaining > 0:
+            return GarminRateLimitError(remaining)
+        for current in _exceptions(exc):
+            if isinstance(current, GarminRateLimitError):
+                return current
+        self._state["rate_limit_count"] += 1
+        fallback = min(self._cooldown * (2 ** min(self._state["rate_limit_count"] - 1, 10)), 7200)
         delay = max(fallback, _retry_after(exc) or 0)
-        self._blocked_until = time.monotonic() + delay
-        error = GarminRateLimitError(delay)
-        self._last_error = str(error)
-        _log(str(error))
-        return error
+        self._state["blocked_until"] = time.time() + delay
+        self._save()
+        return GarminRateLimitError(delay)
 
-    def _ensure(self, force=False):
-        with self._lock:
+    def _transport_guard(self, operation):
+        @functools.wraps(operation)
+        def guarded(*args, **kwargs):
             self._check_cooldown()
-            if force:
-                self._client = None
-            if self._client is not None:
-                return self._client
-            gap = time.monotonic() - self._last_attempt
-            if self._last_error is not None and gap < 20:
-                raise RuntimeError(f"Garmin auth is failing: {self._last_error}")
-            self._last_attempt = time.monotonic()
-            try:
-                self._client = _authenticate()
-                self._last_error = None
-            except Exception as exc:
-                if _is_rate_limit(exc):
-                    raise self._record_rate_limit(exc) from exc
-                self._last_error = f"{type(exc).__name__}: Garmin authentication failed"
-                _log(f"auth failed: {self._last_error}")
-                raise
-            return self._client
+            response = operation(*args, **kwargs)
+            if getattr(response, "status_code", None) == 429:
+                exc = RuntimeError("Garmin HTTP 429")
+                exc.response = response
+                raise self._record_rate_limit(exc)
+            return response
+        return guarded
 
-    def warmup(self):
-        """Authenticate in the background so the first tool call is fast."""
+    def _prepare_tokens(self):
+        if not self._store.tokens.exists():
+            source = os.getenv("GARMIN_TOKEN_SOURCE")
+            inline = os.getenv("GARMIN_TOKENS_JSON")
+            try:
+                if source:
+                    tokens = read_json(Path(source).expanduser())
+                elif inline:
+                    tokens = json.loads(inline)
+                else:
+                    raise GarminSetupError(
+                        "No modern token file. Run scripts/generate_tokens.py locally, "
+                        "then provide GARMIN_TOKEN_SOURCE or GARMIN_TOKENS_JSON. "
+                        "Legacy GARMINTOKENS_BASE64 is not supported. No login was attempted."
+                    )
+                atomic_json(self._store.tokens, validate_tokens(tokens))
+            except (OSError, ValueError) as exc:
+                raise GarminSetupError("Cannot import token file; no login was attempted") from exc
         try:
-            self._ensure()
-            _log("warmup done.")
-        except Exception:
-            _log("warmup failed - will retry on first tool call.")
+            tokens = validate_tokens(read_json(self._store.tokens))
+        except (OSError, ValueError) as exc:
+            raise GarminSetupError("Cannot read saved tokens; refusing stale bootstrap fallback") from exc
+        digest = hashlib.sha256(json.dumps(tokens, sort_keys=True).encode()).hexdigest()
+        if self._state.get("auth_required") and self._state.get("token_digest") == digest:
+            raise GarminSetupError("Saved credentials were rejected. Replace the token file using a local interactive login; automatic login is stopped.")
+        if self._state.get("token_digest") != digest:
+            self._state["auth_required"] = False
+            self._state["token_digest"] = digest
+            self._save()
+        if self._client_digest != digest:
+            self._client = None
+        return digest
+
+    def _call(self, name, *args, **kwargs):
+        if self._fatal_error:
+            raise StorageError(self._fatal_error)
+        with self._lock, self._store.locked():
+            self._state = self._store.read_guard()
+            self._check_cooldown()
+            digest = self._prepare_tokens()
+            try:
+                if self._client is None:
+                    self._client = restore_client(self._store, self._transport_guard)
+                    self._client_digest = digest
+                result = getattr(self._client, name)(*args, **kwargs)
+            except Exception as exc:
+                if any(isinstance(error, StorageError) for error in _exceptions(exc)):
+                    self._fatal_error = "Cannot persist refreshed tokens; requests stopped"
+                    raise StorageError(self._fatal_error) from exc
+                if _is_rate_limit(exc):
+                    error = self._record_rate_limit(exc)
+                    self._last_error = str(error)
+                    if error is exc:
+                        raise
+                    raise error from exc
+                if _is_auth_error(exc):
+                    self._state["auth_required"] = True
+                    # Refresh may already have rotated the file before a 401.
+                    tokens = validate_tokens(read_json(self._store.tokens))
+                    self._state["token_digest"] = hashlib.sha256(json.dumps(tokens, sort_keys=True).encode()).hexdigest()
+                    self._save()
+                    self._client = None
+                    raise GarminSetupError("Garmin rejected the saved credentials. Automatic login is stopped; regenerate tokens locally.") from exc
+                raise
+            # Persisted rotations take precedence over the bootstrap secret.
+            tokens = validate_tokens(read_json(self._store.tokens))
+            self._client_digest = hashlib.sha256(json.dumps(tokens, sort_keys=True).encode()).hexdigest()
+            self._state.update(rate_limit_count=0, blocked_until=0.0, auth_required=False, token_digest=self._client_digest)
+            self._save()
+            self._last_error = None
+            return result
 
     def status(self):
+        # Atomic reads only: health checks never log in or wait on network locks.
+        state = {}
+        error = self._fatal_error
+        if self._store:
+            try:
+                state = self._store.read_guard()
+            except StorageError:
+                error = "Cannot read persisted request guard"
         return {
-            "authenticated": self._client is not None,
-            "last_error": self._last_error,
-            "retry_after_seconds": max(0, math.ceil(self._blocked_until - time.monotonic())),
+            "authenticated": self._client is not None and not state.get("auth_required", False),
+            "storage_ready": self._store is not None and error is None,
+            "token_file_present": self._store is not None and self._store.tokens.is_file(),
+            "auth_required": state.get("auth_required", False),
+            "retry_after_seconds": max(0, math.ceil(state.get("blocked_until", 0) - time.time())),
+            "last_error": error or self._last_error,
         }
 
     def __getattr__(self, name):
-        if name.startswith("_"):
+        if name.startswith("_") or name in ("client", "garth"):
             raise AttributeError(name)
-        client = self._ensure()
-        attr = getattr(client, name)
-        if not callable(attr):
-            return attr
-
-        @functools.wraps(attr)
-        def wrapper(*args, **kwargs):
-            # Serialize requests and refreshes from all clients sharing this process.
-            # Re-check here as callers can retain a method before a cooldown begins.
-            with self._lock:
-                client = self._ensure()
-                try:
-                    result = getattr(client, name)(*args, **kwargs)
-                except Exception as exc:
-                    if _is_rate_limit(exc):
-                        raise self._record_rate_limit(exc) from exc
-                    if not _is_auth_error(exc):
-                        raise
-                    _log(f"auth error, re-authenticating: {type(exc).__name__}")
-                    fresh = self._ensure(force=True)
-                    try:
-                        result = getattr(fresh, name)(*args, **kwargs)
-                    except Exception as retry_exc:
-                        if _is_rate_limit(retry_exc):
-                            raise self._record_rate_limit(retry_exc) from retry_exc
-                        raise
-                self._rate_limit_count = 0
-                self._last_error = None
-                return result
-
-        return wrapper
+        return functools.partial(self._call, name)
 
 
 def init_garmin_client():
-    """Always returns the proxy. No network call happens here."""
     return GarminProxy()

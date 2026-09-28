@@ -11,3 +11,8 @@ dist/
 build/
 .garminconnect/
 .garminconnect_base64
+.garmin-mcp/
+garmin_tokens.json
+request_guard.json
+.request.lock
+.state-*

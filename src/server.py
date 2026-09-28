@@ -2,12 +2,11 @@
 Garmin MCP Server - Poke Compatible
 All 95+ tools from garmin_mcp, served over HTTP.
 
-An auth failure does not kill the process. Authentication happens lazily on
-an explicit tool request; background warmup requires an explicit opt-in.
+An auth failure does not kill the process. Saved tokens are restored lazily
+on an explicit tool request. There is no background login or warmup.
 """
 import os
 import sys
-import threading
 
 # Add src directory to path for module imports
 sys.path.insert(0, os.path.dirname(__file__))
@@ -16,9 +15,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastmcp import FastMCP
+from garmin_mcp import GarminMCP
 from config import PORT, HOST
 from garmin_client import init_garmin_client
+from tool_errors import LegacyToolErrors
 
 # Import all tool modules
 from modules import (
@@ -56,7 +56,8 @@ MODULES = (
 for module in MODULES:
     module.configure(garmin_client)
 
-mcp = FastMCP("Garmin MCP Server")
+mcp = GarminMCP("Garmin MCP Server")
+mcp.add_middleware(LegacyToolErrors())
 
 for module in MODULES:
     mcp = module.register_tools(mcp)
@@ -69,7 +70,13 @@ try:
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request):
-        return JSONResponse({"ok": True, **garmin_client.status()})
+        return JSONResponse({
+            "ok": True,
+            "auth_backend": "di",
+            "guard_version": 2,
+            "revision": os.getenv("RENDER_GIT_COMMIT"),
+            **garmin_client.status(),
+        })
 
 except Exception as exc:
     print(f"[server] skipping /health route: {exc}", file=sys.stderr, flush=True)
@@ -77,11 +84,6 @@ except Exception as exc:
 
 if __name__ == "__main__":
     print(f"Starting Garmin MCP Server on {HOST}:{PORT}", file=sys.stderr, flush=True)
-
-    # Render restarts must not trigger another login during a Garmin outage.
-    # Authenticate on an explicit data request unless warmup is opted into.
-    if os.getenv("GARMIN_AUTH_WARMUP", "false").lower() == "true":
-        threading.Thread(target=garmin_client.warmup, daemon=True).start()
 
     mcp.run(
         transport="http",

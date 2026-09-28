@@ -1,115 +1,83 @@
-# Garmin MCP Server for Poke
+# Garmin MCP Server for Poke / Claude
 
-A [Poke](https://poke.com)-compatible MCP server exposing 90+ [Garmin Connect](https://connect.garmin.com) tools over HTTP via [FastMCP](https://github.com/jlowin/fastmcp). Deployable to Render.
+A FastMCP HTTP server exposing Garmin Connect tools. Based on
+[Taxuspt/garmin_mcp](https://github.com/Taxuspt/garmin_mcp) and
+[InteractionCo/mcp-server-template](https://github.com/InteractionCo/mcp-server-template).
 
-Built on top of [Taxuspt/garmin_mcp](https://github.com/Taxuspt/garmin_mcp) and [InteractionCo/mcp-server-template](https://github.com/InteractionCo/mcp-server-template).
+## Migration requirements
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/theol0403/garmin-mcp-poke)
+**Python 3.12, modern DI tokens, and persistent storage are required.**
+This version replaces the deprecated Garth authentication flow. Existing
+`GARMINTOKENS_BASE64` tokens cannot be converted by changing a setting.
+Server-side email/password login is disabled; generate tokens interactively.
 
-## Setup
+**Do not deploy over the old version until these prerequisites are ready.**
+The default Render Free plan cannot provide a persistent disk. The supplied
+Blueprint does not purchase or upgrade a plan; the server deliberately refuses
+Garmin requests on Render without a mounted persistent state directory.
+See the [Korean deployment and rollback guide](docs/DEPLOYMENT_KO.md).
 
-### 1. Generate OAuth Tokens
+## Local setup
 
-Garmin accounts with MFA require local token generation:
-
-```bash
-pip install garminconnect garth
-python scripts/generate_tokens.py
+```sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python scripts/generate_tokens.py
+HOST=127.0.0.1 .venv/bin/python src/server.py
 ```
 
-This will prompt for your Garmin email, password, and MFA code, then output a base64 token string.
+The generator prompts for email, a hidden password, and MFA if required. It
+writes `~/.garmin-mcp/garmin_tokens.json` privately; it never prints tokens.
+Connect your MCP client to `http://127.0.0.1:8000/mcp` (Streamable HTTP).
 
-### 2. Deploy to Render
+## Durable authentication and rate limiting
 
-#### Option 1: One-Click Deploy
-Click the "Deploy to Render" button above, then set `GARMINTOKENS_BASE64` to the token string from step 1.
+- `GARMIN_STATE_DIR`: private directory holding current tokens and the request
+  guard. Default locally: `~/.garmin-mcp`. Required on a mounted disk on Render.
+- `GARMIN_TOKEN_SOURCE`: optional path to a modern JSON token seed, for example
+  `/etc/secrets/garmin_tokens.json`. `GARMIN_TOKENS_JSON` is an inline alternative.
+  Seeds are imported only if no saved token file exists.
+- Expiring tokens refresh via DI and are atomically persisted before API traffic
+  continues. Disk tokens always take precedence over old bootstrap secrets.
+- A 429 persists a UTC deadline and failure count. Local delay starts at 30 min,
+  doubles to 60 then 120 min, and honors longer upstream `Retry-After` headers.
+  `GARMIN_RATE_LIMIT_COOLDOWN_SEC` configures the initial delay. This is our
+  cooldown policy, **not a guarantee of Garmin's reset time**.
+- Requests and refreshes share an in-process lock and a filesystem lock. All
+  workers on the same disk observe the guard; independent replicas do not.
+- Rejected credentials stop unattended retries until the saved token file is
+  replaced. `scripts/import_tokens.py SOURCE` safely replaces them while
+  preserving active rate-limit deadlines.
+- Startup, tool discovery and `/health` make no Garmin requests. HTTP health
+  is liveness only, not evidence of authentication success.
+- Existing tool error strings become MCP `isError` responses.
 
-#### Option 2: Manual Deployment
-1. Fork this repository
-2. Connect your GitHub account to Render
-3. Create a new Web Service on Render
-4. Connect your forked repository
-5. Render will automatically detect the `render.yaml` configuration
-6. Set `GARMINTOKENS_BASE64` in environment variables
+The small native transport/refresh adapter uses private hooks of the exact
+pinned garminconnect version. Do not update the dependency without rerunning
+the offline integration tests. These hooks prevent upstream retry behavior
+from swallowing refresh errors or sending another request after 429.
 
-Your server will be available at `https://your-service-name.onrender.com/mcp`
+## Deployment
 
-### 3. Connect Poke
+Read [DEPLOYMENT_KO.md](docs/DEPLOYMENT_KO.md) for the existing Render service.
+Prepare the disk and new tokens first, then deploy manually. No keep-alive ping
+job is required for correctness. Shared IP limits and Garmin-side outages are
+outside this patch's control. A successful real activity read remains required
+before claiming recovery.
 
-Add your Render URL to Poke at [poke.com/settings/connections](https://poke.com/settings/connections):
-```
-https://your-service-name.onrender.com/mcp
-```
+## Verification
 
-## Local Development
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env and set GARMINTOKENS_BASE64
-python src/server.py
-```
-
-Test with MCP Inspector:
-```bash
-npx @modelcontextprotocol/inspector
-```
-Open http://localhost:3000 and connect to `http://localhost:8000/mcp` using "Streamable HTTP" transport.
-
-## Token Refresh
-
-### Garmin authentication returns HTTP 429
-
-The server pauses Garmin requests for 30 minutes after a 429, doubles that
-local delay on repeated failures (up to two hours), and respects longer
-`Retry-After` values when the upstream exception exposes that header. This
-is a client cooldown, **not a guarantee that Garmin will accept the next request**.
-`GARMIN_RATE_LIMIT_COOLDOWN_SEC` changes the initial local delay in seconds.
-Requests and token refreshes are serialized within the server process.
-`/health` reports `retry_after_seconds` without contacting Garmin.
-
-Authentication warmup is disabled by default. Render startup and health checks
-do not initiate a Garmin login. Set `GARMIN_AUTH_WARMUP=true` only if startup
-authentication is intentionally required.
-
-Do not repeatedly restart, redeploy, regenerate tokens, or retry from multiple
-clients during a rate limit. The cooldown is held in memory and resets when
-the process restarts; it is not coordinated across multiple server replicas.
-After the cooldown, make one small read to check access. If it returns 429,
-stop and investigate authentication library compatibility and token validity.
-
-This guard does not repair expired tokens or migrate the legacy Garth login
-flow. The server still intentionally pins garminconnect below 0.3 because
-its existing token and workout code depend on Garth. Changing that pin alone
-is not a supported migration.
-
-Run the credential-free regression tests with:
-
-```bash
-python -m unittest discover -s tests -v
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m compileall -q src scripts tests
 ```
 
-Tokens last approximately 6 months. When they expire, re-run `generate_tokens.py` and update the Render env var.
+Tests mock HTTP using the real pinned Garmin/FastMCP dependencies. They cover
+restart persistence, token rotation, 429 during refresh and profile reads,
+private file permissions, fail-closed storage errors, request serialization,
+workout API compatibility and actual MCP error propagation. They do not log in
+to Garmin or perform live writes.
 
-## Tool Categories
-
-| Category | Tools | Examples |
-|----------|-------|---------|
-| Activity Management | 14 | Activities by date, splits, weather, HR zones, gear |
-| Health & Wellness | 28 | Stats, sleep, stress, body battery, HRV, SpO2, steps |
-| Training | 10 | Training status, endurance score, hill score, lactate threshold |
-| User Profile | 4 | Profile info, settings, unit system |
-| Devices | 7 | Device list, settings, alarms, solar data |
-| Gear Management | 3 | Gear inventory, add/remove gear from activities |
-| Weight Management | 5 | Weigh-ins, add/delete measurements |
-| Challenges | 10 | Goals, badges, challenges, race predictions, PRs |
-| Workouts | 7 | Workout library, scheduling, training plans, upload |
-| Data Management | 3 | Body composition, blood pressure, hydration |
-| Women's Health | 3 | Pregnancy, menstrual cycle tracking |
-| Workout Templates | 5 | Resources with workout JSON templates |
-
-## Attribution
-
-Built on top of:
-- [Taxuspt/garmin_mcp](https://github.com/Taxuspt/garmin_mcp) -- Garmin Connect MCP tool modules and authentication flow
-- [InteractionCo/mcp-server-template](https://github.com/InteractionCo/mcp-server-template) -- FastMCP HTTP server template for Render/Poke
+Existing health, training, activity, device, workout, gear, weight, challenge,
+profile and women's health tool names are retained. Completed-activity FIT
+bulk download is not added by this authentication repair.
