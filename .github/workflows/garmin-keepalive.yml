@@ -3,8 +3,9 @@ name: Garmin MCP health keepalive
 on:
   workflow_dispatch:
   schedule:
-    # GitHub schedules can be delayed; durable tokens also survive cold starts.
-    - cron: '3-59/10 * * * *'
+    # Explicit ten-minute slots re-register the schedule on the default branch.
+    # A saved schedule is not proof of execution; check actual schedule events.
+    - cron: '4,14,24,34,44,54 * * * *'
 
 permissions:
   contents: read

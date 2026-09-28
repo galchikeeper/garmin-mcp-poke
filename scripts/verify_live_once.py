@@ -23,6 +23,10 @@ HEALTH_URL = ORIGIN + "/health"
 MCP_URL = ORIGIN + "/mcp"
 DEFAULT_MARKER = Path(__file__).resolve().parents[1] / ".secrets" / "live-acceptance.json"
 COOLDOWN_MARGIN_SECONDS = 60
+# Free Render instances may need about a minute to wake. This applies only to
+# process health, never to Garmin calls, and does not introduce any retries.
+HEALTH_READ_TIMEOUT_SECONDS = 85
+HEALTH_TOTAL_TIMEOUT_SECONDS = 90
 SAFE_ERRORS = frozenset({
     "LOCAL_TOKEN_SEED_REQUIRED", "INVALID_TOKEN_SEED", "GARMIN_RATE_LIMITED",
     "GARMIN_AUTH_REJECTED_LOCAL_RESEED_REQUIRED", "GARMIN_REQUEST_FAILED",
@@ -106,6 +110,21 @@ def strict_json(text):
     return json.loads(text, parse_constant=reject_constant, object_pairs_hook=unique_pairs)
 
 
+def health_error_code(exc):
+    """Fixed diagnostic labels only: never expose exception text or responses."""
+    import httpx
+
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return "health_timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return "health_http_error"
+    if isinstance(exc, httpx.RequestError):
+        return "health_connection_error"
+    if isinstance(exc, (ValueError, TypeError, RecursionError)):
+        return "health_invalid_response"
+    return "health_unknown_error"
+
+
 def valid_stats_result(result, requested_date):
     """get_stats catches errors as text, so isError=false alone proves nothing."""
     if getattr(result, "isError", None) is not False:
@@ -166,8 +185,9 @@ async def verify_once(*, requested_date, marker_path, fetch_health, call_stats, 
         return {**report, "status": "already_attempted", "reason": "marker_exists_do_not_retry"}
     try:
         before = safe_health(await fetch_health())
-    except Exception:
-        return {**report, "reason": "preflight_health_unavailable_or_invalid"}
+    except Exception as exc:
+        return {**report, "reason": "preflight_health_unavailable_or_invalid",
+                "health_error_code": health_error_code(exc)}
     report["health_before"] = before
     if not (before["ok"] and before["tokens_loaded"]
             and before["server_password_login_enabled"] is False
@@ -214,7 +234,8 @@ async def verify_once(*, requested_date, marker_path, fetch_health, call_stats, 
                     report.update(status="passed", reason="read_only_result_and_persistence_verified")
                 else:
                     report.update(status="attempted_failed", reason="postflight_state_not_verified")
-        except Exception:
+        except Exception as exc:
+            report["health_error_code"] = health_error_code(exc)
             if result_valid:
                 report.update(status="attempted_unknown", reason="postflight_health_unavailable_or_invalid")
         report["finished_at"] = iso(now())
@@ -229,13 +250,16 @@ async def fetch_live_health():
     import httpx
 
     # No credentials, redirects, environment proxies, or request retries.
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=15),
-                                 follow_redirects=False, trust_env=False) as client:
-        response = await client.get(HEALTH_URL)
-        response.raise_for_status()
-        if len(response.content) > 64 * 1024:
-            raise ValueError("health_response_too_large")
-        return strict_json(response.text)
+    async with asyncio.timeout(HEALTH_TOTAL_TIMEOUT_SECONDS):
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(HEALTH_READ_TIMEOUT_SECONDS, connect=15),
+            follow_redirects=False, trust_env=False,
+        ) as client:
+            response = await client.get(HEALTH_URL)
+            response.raise_for_status()
+            if len(response.content) > 64 * 1024:
+                raise ValueError("health_response_too_large")
+            return strict_json(response.text)
 
 
 async def call_live_stats(requested_date):

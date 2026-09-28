@@ -356,7 +356,7 @@ def test_real_health_adapter_is_fixed_bounded_and_credential_free(monkeypatch):
     class FakeClient:
         def __init__(self, timeout, follow_redirects, trust_env):
             assert timeout.connect == 15
-            assert timeout.read == 30
+            assert timeout.read == 85
             assert follow_redirects is False
             assert trust_env is False
 
@@ -374,3 +374,82 @@ def test_real_health_adapter_is_fixed_bounded_and_credential_free(monkeypatch):
     result = asyncio.run(command.fetch_live_health())
     assert result["ok"] is True
     assert calls == ["https://garmin-mcp-server-kj2q.onrender.com/health"]
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("read_timeout", "health_timeout"),
+    ("total_timeout", "health_timeout"),
+    ("connect", "health_connection_error"),
+    ("http", "health_http_error"),
+    ("json", "health_invalid_response"),
+    ("unknown", "health_unknown_error"),
+])
+def test_health_failure_diagnostic_is_fixed_and_never_retried(tmp_path, kind, expected):
+    import httpx
+
+    request = httpx.Request("GET", command.HEALTH_URL)
+    errors = {
+        "read_timeout": httpx.ReadTimeout(PRIVATE),
+        "total_timeout": TimeoutError(PRIVATE),
+        "connect": httpx.ConnectError(PRIVATE),
+        "http": httpx.HTTPStatusError(PRIVATE, request=request,
+                                       response=httpx.Response(503, request=request)),
+        "json": ValueError(PRIVATE),
+        "unknown": RuntimeError(PRIVATE),
+    }
+    scenario = Scenario(tmp_path)
+    scenario.health_error = errors[kind]
+    report = scenario.run()
+    assert report["health_error_code"] == expected
+    assert report["status"] == "blocked"
+    assert report["tool_calls"] == 0
+    assert scenario.health_calls == 1
+    assert not scenario.marker.exists()
+    assert PRIVATE not in json.dumps(report)
+
+
+def test_health_total_deadline_cancels_a_slow_response_without_retry(monkeypatch):
+    import httpx
+
+    calls = []
+
+    class SlowClient:
+        def __init__(self, **kwargs):
+            assert kwargs["timeout"].read == 85
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            calls.append(url)
+            await asyncio.sleep(1)
+            raise AssertionError("deadline did not cancel the response")
+
+    assert command.HEALTH_TOTAL_TIMEOUT_SECONDS == 90
+    monkeypatch.setattr(command, "HEALTH_TOTAL_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(httpx, "AsyncClient", SlowClient)
+    with pytest.raises(TimeoutError):
+        asyncio.run(command.fetch_live_health())
+    assert calls == [command.HEALTH_URL]
+
+
+def test_postflight_timeout_keeps_marker_and_does_not_repeat_garmin(tmp_path):
+    scenario = Scenario(tmp_path)
+
+    async def fetch():
+        scenario.health_calls += 1
+        if scenario.health_calls == 1:
+            return health()
+        raise TimeoutError(PRIVATE)
+
+    scenario.fetch_health = fetch
+    report = scenario.run()
+    assert report["status"] == "attempted_unknown"
+    assert report["health_error_code"] == "health_timeout"
+    assert scenario.tool_calls == [DATE]
+    assert PRIVATE not in scenario.marker.read_text()
+    assert scenario.run()["status"] == "already_attempted"
+    assert scenario.tool_calls == [DATE]

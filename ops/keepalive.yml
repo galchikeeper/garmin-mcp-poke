@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
   schedule:
     # Offset from the top of the hour; GitHub schedules can still be delayed/dropped.
-    - cron: '3-59/10 * * * *'
+    - cron: '4,14,24,34,44,54 * * * *'
 
 permissions:
   contents: read
