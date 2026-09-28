@@ -3,8 +3,8 @@ Garmin MCP Server - Poke Compatible
 All 95+ tools from garmin_mcp, served over HTTP.
 
 2026-09-10: an auth failure no longer kills the process.
-The server always starts. Authentication runs as a background warmup and is
-retried lazily on the first tool call that needs it.
+The server always starts. Warmup only restores encrypted tokens from storage.
+Garmin is contacted only by an explicit MCP tool call, never by /health.
 """
 import os
 import sys
@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastmcp import FastMCP
+from tool_runtime import GarminMCP
 from config import PORT, HOST
 from garmin_client import init_garmin_client
 
@@ -57,7 +57,7 @@ MODULES = (
 for module in MODULES:
     module.configure(garmin_client)
 
-mcp = FastMCP("Garmin MCP Server")
+mcp = GarminMCP("Garmin MCP Server")
 
 for module in MODULES:
     mcp = module.register_tools(mcp)
@@ -79,7 +79,7 @@ except Exception as exc:
 if __name__ == "__main__":
     print(f"Starting Garmin MCP Server on {HOST}:{PORT}", file=sys.stderr, flush=True)
 
-    # Warm up auth in parallel with the server bind to cut first-call latency.
+    # Restore persisted state only. Never call Garmin on a health ping.
     threading.Thread(target=garmin_client.warmup, daemon=True).start()
 
     mcp.run(

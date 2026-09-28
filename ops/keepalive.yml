@@ -1,0 +1,47 @@
+# TEMPLATE ONLY: this file does not schedule anything while it remains in ops/.
+# Install in .github/workflows/ only after completing OPERATIONS.md prerequisites.
+name: Garmin MCP health keepalive
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Offset from the top of the hour; GitHub schedules can still be delayed/dropped.
+    - cron: '3-59/10 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garmin-mcp-health-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  health:
+    # Public repositories avoid private-runner minute charges. This variable must
+    # remain unset until the safe /health and Render-hour prerequisites are met.
+    if: ${{ github.event.repository.private == false && vars.RENDER_FREE_HOURS_VERIFIED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check process health once
+        shell: bash
+        env:
+          HEALTH_URL: https://garmin-mcp-server-kj2q.onrender.com/health
+        run: |
+          set -euo pipefail
+          health_file="$(mktemp)"
+          curl --fail --silent --show-error \
+            --proto '=https' --connect-timeout 15 --max-time 85 --retry 0 \
+            --output "$health_file" "$HEALTH_URL"
+          python3 - "$health_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as response:
+              health = json.load(response)
+          if not isinstance(health, dict) or health.get("ok") is not True:
+              raise SystemExit("Health endpoint did not report process readiness.")
+          # Authentication can legitimately be false during cooldown. Do not
+          # invoke Garmin, retry login, or expose the complete response in logs.
+          print("Process health OK; Garmin authentication was not tested.")
+          PY

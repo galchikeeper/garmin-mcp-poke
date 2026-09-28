@@ -3,6 +3,10 @@ __pycache__/
 *$py.class
 *.so
 .env
+.env.*
+!.env.example
+.secrets/
+.pytest_cache/
 .venv/
 venv/
 env/
